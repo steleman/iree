@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUInterfaces.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "mlir/IR/Types.h"
 
 namespace mlir::iree_compiler {
@@ -73,6 +74,21 @@ struct GPUMMAHeuristicSeeds {
   // some chosen intrinsic `bestIntrinsic`.
   int64_t bestKElementCountPerSubgroup = 0;
 };
+
+/// Callback type for adjusting heuristic seeds based on workgroup count and
+/// intrinsic. Called per-intrinsic inside deduceMMASchedule before schedule
+/// deduction.
+using SeedAdjustFn = llvm::function_ref<void(
+    const GPUMatmulShapeType &problem, const GPUIntrinsicType &intrinsic,
+    std::optional<int64_t> wgpCount, GPUMMAHeuristicSeeds &seeds,
+    int64_t splitReductionTripCnt)>;
+
+/// Default seed adjuster: reduces MNT until workgroups fill all CUs.
+void adjustSeedsForWgpCount(const GPUMatmulShapeType &problem,
+                            const GPUIntrinsicType &intrinsic,
+                            std::optional<int64_t> wgpCount,
+                            GPUMMAHeuristicSeeds &seeds,
+                            int64_t splitReductionTripCnt);
 
 struct GPUMMASchedule {
   // The MMA intrinsic kind to use for this schedule.
@@ -157,7 +173,8 @@ FailureOr<GPUMMASchedule> deduceMMASchedule(
     int64_t subgroupSize, std::optional<int64_t> cuCount, Location loc,
     bool transposedLhs = false, bool transposedRhs = false,
     bool canUpcastAcc = false, bool mustBeAligned = true,
-    bool doCPromotion = false, int64_t splitReductionTripCnt = 0);
+    bool doCPromotion = false, int64_t splitReductionTripCnt = 0,
+    SeedAdjustFn seedAdjuster = adjustSeedsForWgpCount);
 
 /// Returns a schedule for the pvMatmul in attention using one of the given MMA
 /// |intrinsics| to target the given attention matmul problems, |qkMatmul|

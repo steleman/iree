@@ -259,7 +259,8 @@ static GemmCutoff computeGemmCutoffsForAI(IREE::GPU::TargetAttr target,
 }
 
 static std::optional<GPUMMAHeuristicSeeds>
-getGemmHeuristicSeeds(GemmSize gemmSize, int64_t inBitWidth, bool scaled) {
+getGemmHeuristicSeeds(GemmSize gemmSize, int64_t inBitWidth, bool scaled,
+                      IREE::GPU::TargetAttr target = nullptr) {
   switch (gemmSize) {
   case GemmSize::SmallGemm:
     return GPUMMAHeuristicSeeds(
@@ -284,6 +285,14 @@ getGemmHeuristicSeeds(GemmSize gemmSize, int64_t inBitWidth, bool scaled) {
   case GemmSize::LargeGemm:
   case GemmSize::VeryLargeGemm:
     if (scaled) {
+      return GPUMMAHeuristicSeeds(
+          {/*bestSubgroupCountPerWorkgroup=*/8,
+           /*bestMNTileCountPerSubgroup=*/32,
+           /*bestKTileCountPerSubgroup=*/2,
+           /*bestKElementCountPerSubgroup=*/kCacheLineSizeBits / 2 /
+               inBitWidth});
+    }
+    if (target && target.getArch() == "gfx950") {
       return GPUMMAHeuristicSeeds(
           {/*bestSubgroupCountPerWorkgroup=*/8,
            /*bestMNTileCountPerSubgroup=*/32,
@@ -334,13 +343,128 @@ getConvolutionHeuristicSeeds(GemmSize gemmSize, int64_t inBitWidth) {
 
 static std::optional<GPUMMAHeuristicSeeds>
 getContractionHeuristicSeeds(GPUMatmulShapeType problem, bool isGemm,
-                             bool scaled) {
+                             bool scaled,
+                             IREE::GPU::TargetAttr target = nullptr) {
   GemmSize gemmSize = problem.gemmSize;
   int64_t inBitWidth = problem.aType.getIntOrFloatBitWidth();
   if (isGemm) {
-    return getGemmHeuristicSeeds(gemmSize, inBitWidth, scaled);
+    return getGemmHeuristicSeeds(gemmSize, inBitWidth, scaled, target);
   }
   return getConvolutionHeuristicSeeds(gemmSize, inBitWidth);
+}
+
+/// GFX950-specific seed adjustment with utilization-aware guard and joint
+/// sg+MNT reduction tuned for CDNA4.
+static void adjustGfx950SeedsForWgpCount(const GPUMatmulShapeType &problem,
+                                         const GPUIntrinsicType &intrinsic,
+                                         std::optional<int64_t> wgpCount,
+                                         GPUMMAHeuristicSeeds &seeds,
+                                         int64_t splitReductionTripCnt) {
+  if (!wgpCount.has_value()) {
+    LDBG() << "WGP count is not available,"
+           << "Skipping adjustment of seeds for workgroup count.";
+    return;
+  }
+
+  if (problem.gemmSize == GemmSize::NotSet ||
+      problem.gemmSize == GemmSize::SmallGemm) {
+    LDBG() << "Arithmetic intensity is too low, "
+           << "skipping adjustment of seeds for workgroup count.";
+    return;
+  }
+  int64_t mSize = ShapedType::getNumElements(problem.mSizes);
+  int64_t nSize = ShapedType::getNumElements(problem.nSizes);
+  auto computeWorkgroupCount = [&] {
+    int64_t mnTileSizePerSubgroup = seeds.bestMNTileCountPerSubgroup *
+                                    intrinsic.mSizes[0] * intrinsic.nSizes[0];
+    int64_t workgroupSize =
+        mnTileSizePerSubgroup * seeds.bestSubgroupCountPerWorkgroup;
+    int64_t numWorkgroups = mSize * nSize / workgroupSize;
+    if (splitReductionTripCnt > 1) {
+      numWorkgroups *= splitReductionTripCnt;
+    }
+    return numWorkgroups;
+  };
+  int64_t numWorkgroups = computeWorkgroupCount();
+  LDBG() << "Estimated number of workgroups: " << numWorkgroups
+         << ", WGP count: " << wgpCount;
+
+  // Compute CU utilization: the fraction of CUs active across all waves.
+  // When workgroup count barely exceeds a multiple of CU count, the last
+  // wave has most CUs idle, wasting GPU throughput. For example, 320
+  // workgroups on 256 CUs gives 2 waves but only 62.5% utilization.
+  // Reduce tile size and subgroup count until utilization is acceptable.
+  constexpr double kMinUtilizationThreshold = 0.80;
+  auto computeUtilization = [&]() -> double {
+    int64_t waves = llvm::divideCeil(numWorkgroups, *wgpCount);
+    if (waves == 0) {
+      return 0.0;
+    }
+    return static_cast<double>(numWorkgroups) / (waves * *wgpCount);
+  };
+
+  // Reduce MN tile count (and subgroup count for LargeGemm) to increase
+  // workgroup count and improve CU utilization. For LargeGemm, seeds are
+  // inflated (e.g., sg=8, MNT=32) so both must be reduced together to
+  // maintain balanced tile shapes and avoid excessive thread overhead.
+  // For MediumGemm, only MNT is reduced to match pre-tuning behavior.
+  // Maintain a minimum subgroup count to ensure enough threads per workgroup
+  // for latency hiding during K-loop iterations.
+  bool isLargeGemm = (problem.gemmSize == GemmSize::LargeGemm);
+  constexpr int64_t kMinSubgroupCount = 2;
+  while (computeUtilization() < kMinUtilizationThreshold) {
+    bool reduced = false;
+    if (seeds.bestMNTileCountPerSubgroup > 1) {
+      seeds.bestMNTileCountPerSubgroup /= 2;
+      reduced = true;
+    }
+    if (isLargeGemm &&
+        seeds.bestSubgroupCountPerWorkgroup > kMinSubgroupCount) {
+      seeds.bestSubgroupCountPerWorkgroup /= 2;
+      reduced = true;
+    }
+    if (!reduced) {
+      break;
+    }
+    LDBG() << "Decreasing seeds to bestMNTileCountPerSubgroup="
+           << seeds.bestMNTileCountPerSubgroup
+           << ", bestSubgroupCountPerWorkgroup="
+           << seeds.bestSubgroupCountPerWorkgroup;
+    numWorkgroups = computeWorkgroupCount();
+  }
+
+  // For large K dimensions, each workgroup iterates over many K tiles.
+  // With inflated subgroup seeds (e.g., sg=8), each subgroup accumulates
+  // many MMA tiles, consuming excessive VGPRs for accumulators and causing
+  // register spilling to scratch memory. Ensure enough workgroups (multiple
+  // waves) to improve latency hiding and reduce per-workgroup pressure.
+  int64_t kSize = ShapedType::getNumElements(problem.kSizes);
+  int64_t kIntrinsicSize = ShapedType::getNumElements(intrinsic.kSizes);
+  int64_t kIterations = kSize / kIntrinsicSize;
+  constexpr int64_t kLargeKIterationThreshold = 1024;
+  if (isLargeGemm && kIterations > kLargeKIterationThreshold) {
+    int64_t minWorkgroups = 2 * *wgpCount;
+    while (numWorkgroups < minWorkgroups) {
+      bool reduced = false;
+      if (seeds.bestMNTileCountPerSubgroup > 1) {
+        seeds.bestMNTileCountPerSubgroup /= 2;
+        reduced = true;
+      }
+      if (seeds.bestSubgroupCountPerWorkgroup > 1) {
+        seeds.bestSubgroupCountPerWorkgroup /= 2;
+        reduced = true;
+      }
+      if (!reduced) {
+        break;
+      }
+      LDBG() << "Large K (" << kSize
+             << "): decreasing seeds to bestMNTileCountPerSubgroup="
+             << seeds.bestMNTileCountPerSubgroup
+             << ", bestSubgroupCountPerWorkgroup="
+             << seeds.bestSubgroupCountPerWorkgroup;
+      numWorkgroups = computeWorkgroupCount();
+    }
+  }
 }
 
 /// Given a target and a matmul problem, try to find an MMA schedule for the
@@ -439,7 +563,7 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
   }
   LDBG() << "This config is " << problem.gemmSize;
   std::optional<GPUMMAHeuristicSeeds> maybeSeeds =
-      getContractionHeuristicSeeds(problem, isGemm, scaled);
+      getContractionHeuristicSeeds(problem, isGemm, scaled, target);
   assert(maybeSeeds.has_value() && "expected seeds to be found");
   GPUMMAHeuristicSeeds seeds = maybeSeeds.value();
 
@@ -450,11 +574,17 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
     wgpCount = chip.getWgpCount();
   }
 
+  SeedAdjustFn seedAdjuster = adjustSeedsForWgpCount;
+  if (target.getArch() == "gfx950") {
+    seedAdjuster = adjustGfx950SeedsForWgpCount;
+  }
+
   // First try to find a schedule with an exactly matching intrinsic.
   std::optional<GPUMMASchedule> schedule = deduceMMASchedule(
       problem, intrinsics, seeds, maxSharedMemoryBytes, targetSubgroupSize,
       wgpCount, loc, transposedLhs, transposedRhs, /*canUpcastAcc=*/false,
-      /*mustBeAligned=*/mustBeAligned, doCPromotion, splitReductionTripCnt);
+      /*mustBeAligned=*/mustBeAligned, doCPromotion, splitReductionTripCnt,
+      seedAdjuster);
   return schedule;
 }
 
