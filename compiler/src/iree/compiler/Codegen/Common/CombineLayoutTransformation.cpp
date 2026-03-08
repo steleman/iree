@@ -13,6 +13,7 @@
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -531,10 +532,80 @@ static MapStoreOp insertIdentityMapStore(RewriterBase &rewriter,
   return mapStoreOp;
 }
 
-bool isSupportedSingleInputRelayoutOp(Operation *op) {
+bool isSupportedSingleInputRelayoutOpForResult(Operation *op) {
   return isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp,
              tensor::ExtractSliceOp, tensor::PadOp, linalg::CopyOp,
              linalg::TransposeOp>(op);
+}
+
+bool isSupportedSingleInputRelayoutOpForSource(Operation *op) {
+  if (isSupportedSingleInputRelayoutOpForResult(op)) {
+    return true;
+  }
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+  return linalgOp && linalg::isaBroadcastOpInterface(linalgOp).has_value();
+}
+
+/// Collects all relayout ops in the chain starting from `relayoutOp`
+/// (inclusive). The chain extends through result->user edges where the user is
+/// a supported relayout op.
+static void collectRelayoutChain(Operation *relayoutOp,
+                                 SmallPtrSetImpl<Operation *> &chain) {
+  if (!chain.insert(relayoutOp).second) {
+    return;
+  }
+  Value result = relayoutOp->getResult(0);
+  for (Operation *user : result.getUsers()) {
+    if (isSupportedSingleInputRelayoutOpForSource(user) &&
+        user->getOperand(0) == result) {
+      collectRelayoutChain(user, chain);
+    }
+  }
+}
+
+/// Returns true if the relayout op starts a "complex" chain.
+/// A "complex" chain is one that is difficult for bufferization to handle. The
+/// conditions are:
+/// - The chain length must be >= 2.
+/// - The chain must contain at least one reshape op (expand_shape or
+/// collapse_shape).
+/// - The chain must contain at least one op that is not extract_slice or a
+/// reshape op.
+static bool isComplexRelayoutChain(Operation *relayoutOp) {
+  assert(isSupportedSingleInputRelayoutOpForSource(relayoutOp) &&
+         "expected a supported relayout op");
+  SmallPtrSet<Operation *, 4> chain;
+  collectRelayoutChain(relayoutOp, chain);
+  if (chain.size() < 2) {
+    return false;
+  }
+  bool hasReshape = llvm::any_of(chain, [](Operation *op) {
+    return isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp>(op);
+  });
+  // Need at least one op that is not reshape and not extract_slice (e.g. copy,
+  // transpose, broadcast, pad).
+  bool hasOtherNonExtractSlice = llvm::any_of(chain, [](Operation *op) {
+    return !isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp,
+                tensor::ExtractSliceOp>(op);
+  });
+  return hasReshape && hasOtherNonExtractSlice;
+}
+
+/// Collects direct relayout op users of `loadResult` that start complex
+/// relayout chains. When `combineNonComplexChains` is true it includes all
+/// relayout op users regardless of complexity.
+static SmallPtrSet<Operation *, 4>
+getComplexChainRelayoutUsers(Value loadResult,
+                             bool combineNonComplexChains = false) {
+  SmallPtrSet<Operation *, 4> complexUsers;
+  for (Operation *user : loadResult.getUsers()) {
+    if (isSupportedSingleInputRelayoutOpForSource(user) &&
+        user->getOperand(0) == loadResult &&
+        (combineNonComplexChains || isComplexRelayoutChain(user))) {
+      complexUsers.insert(user);
+    }
+  }
+  return complexUsers;
 }
 
 // This is only desirable in the dispatch scope but not in the workgroup scope.
@@ -548,11 +619,11 @@ shouldDoReshapesByExpansion(IREE::Codegen::RelayoutCombinationScope scope) {
 
 /// Insert identity map_store ops after the given operation if it is a valid
 /// leaf op of a relayout op chain. A relayout op chain is a sequence of
-/// relayout ops (defined by `isSupportedSingleInputRelayoutOp`) for which the
-/// only users of the ops in the chain are relayout ops, except for the leaves
-/// of the chain. The leaves are simply relayout ops that have non relayout op
-/// users. The `controlFn` is a callback on the leaf OpResult that provides
-/// control over whether or not to insert a map_store op.
+/// relayout ops (defined by `isSupportedSingleInputRelayoutOpForResult`) for
+/// which the only users of the ops in the chain are relayout ops, except for
+/// the leaves of the chain. The leaves are simply relayout ops that have non
+/// relayout op users. The `controlFn` is a callback on the leaf OpResult that
+/// provides control over whether or not to insert a map_store op.
 struct InsertMapStoreOpPattern : public RewritePattern {
   InsertMapStoreOpPattern(MLIRContext *context,
                           CombineRelayoutOpsControlFnRef controlFn = nullptr,
@@ -562,12 +633,13 @@ struct InsertMapStoreOpPattern : public RewritePattern {
 
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
-    if (!isSupportedSingleInputRelayoutOp(op)) {
+    if (!isSupportedSingleInputRelayoutOpForResult(op)) {
       return failure();
     }
     // Relayout ops with only relayout op users are not leaves.
     auto isDimOrSupportedRelayoutOp = [](Operation *op) {
-      return isSupportedSingleInputRelayoutOp(op) || isa<tensor::DimOp>(op);
+      return isSupportedSingleInputRelayoutOpForResult(op) ||
+             isa<tensor::DimOp>(op);
     };
     if (llvm::all_of(op->getUsers(), isDimOrSupportedRelayoutOp)) {
       return failure();
@@ -752,7 +824,7 @@ getCombineRelayoutOpsControlFn(IREE::Codegen::RelayoutCombinationScope scope) {
       // it, so don't introduce map_store.
       llvm::SetVector<Operation *> slice;
       BackwardSliceOptions options;
-      options.filter = isSupportedSingleInputRelayoutOp;
+      options.filter = isSupportedSingleInputRelayoutOpForResult;
       options.inclusive = true;
       LogicalResult result =
           getBackwardSlice(parallelInsertOp.getSource(), &slice, options);
@@ -983,6 +1055,31 @@ foldExtractSliceIntoMapLoad(RewriterBase &rewriter,
                                      indexTransformBuilder);
 }
 
+/// Fold a consumer broadcast op (named or generic) into a producer `map_load`.
+static FailureOr<MapLoadOp>
+foldBroadcastIntoMapLoad(RewriterBase &rewriter, linalg::LinalgOp broadcastOp,
+                         MapLoadOp mapLoadOp) {
+  if (!linalg::isaBroadcastOpInterface(broadcastOp).has_value()) {
+    return rewriter.notifyMatchFailure(broadcastOp.getOperation(),
+                                       "op is not a broadcast");
+  }
+  assert(broadcastOp.getDpsInputs()[0] == mapLoadOp.getResult(0) &&
+         "expected map_load to be the producer of broadcast input");
+
+  AffineMap inputMap = broadcastOp.getIndexingMapsArray()[0];
+  return foldConsumerIntoMapLoadImpl(
+      rewriter, broadcastOp.getOperation(), mapLoadOp,
+      [inputMap](ArrayRef<BlockArgument> indices) -> SmallVector<Value> {
+        SmallVector<Value> sourceIndices;
+        sourceIndices.reserve(inputMap.getNumResults());
+        for (AffineExpr expr : inputMap.getResults()) {
+          unsigned pos = cast<AffineDimExpr>(expr).getPosition();
+          sourceIndices.push_back(indices[pos]);
+        }
+        return sourceIndices;
+      });
+}
+
 /// Fold a consumer `padOp` into a producer `mapLoadOp`.
 /// Index transformation: source_idx = new_idx - low_pad
 /// Fill value is set to the pad value.
@@ -1050,6 +1147,9 @@ FailureOr<MapLoadOp> foldIntoMapLoad(RewriterBase &rewriter, Operation *op,
       .Case<tensor::PadOp>([&](tensor::PadOp padOp) {
         return foldPadIntoMapLoad(rewriter, padOp, mapLoadOp);
       })
+      .Case<linalg::LinalgOp>([&](linalg::LinalgOp linalgOp) {
+        return foldBroadcastIntoMapLoad(rewriter, linalgOp, mapLoadOp);
+      })
       .Default([](Operation *) { return failure(); });
 }
 
@@ -1060,10 +1160,12 @@ struct FoldConsumerRelayoutIntoMapLoadPattern
 
   LogicalResult matchAndRewrite(IREE::LinalgExt::MapLoadOp mapLoadOp,
                                 PatternRewriter &rewriter) const override {
-    // Find a consumer relayout op.
+    // Find a consumer relayout op (one that uses map_load result as its input).
     Operation *consumerOp = nullptr;
+    Value mapLoadResult = mapLoadOp.getResult(0);
     for (Operation *user : mapLoadOp->getUsers()) {
-      if (isSupportedSingleInputRelayoutOp(user)) {
+      if (isSupportedSingleInputRelayoutOpForSource(user) &&
+          user->getOperand(0) == mapLoadResult) {
         consumerOp = user;
         break;
       }
@@ -1078,12 +1180,18 @@ struct FoldConsumerRelayoutIntoMapLoadPattern
   }
 };
 
-// Insert identity map_load op after the root and replace uses.
-static MapLoadOp insertIdentityMapLoad(RewriterBase &rewriter, OpResult root) {
+// Insert identity map_load op after the root and replace only uses whose
+// owner is in `complexChainUsers` (i.e. uses that are part of a complex
+// relayout chain). Other uses keep using the load/root directly.
+static MapLoadOp
+insertIdentityMapLoad(RewriterBase &rewriter, OpResult root,
+                      const SmallPtrSetImpl<Operation *> &complexChainUsers) {
   Location loc = root.getLoc();
   SetVector<OpOperand *> originalUses;
   for (OpOperand &use : root.getUses()) {
-    originalUses.insert(&use);
+    if (complexChainUsers.contains(use.getOwner())) {
+      originalUses.insert(&use);
+    }
   }
   OpBuilder::InsertionGuard g(rewriter);
   rewriter.setInsertionPointAfterValue(root);
@@ -1105,16 +1213,17 @@ static MapLoadOp insertIdentityMapLoad(RewriterBase &rewriter, OpResult root) {
 /// relayout ops into it iteratively.
 struct InsertMapLoadOpPattern
     : public OpRewritePattern<IREE::Codegen::LoadFromBufferOp> {
-  using OpRewritePattern::OpRewritePattern;
+  InsertMapLoadOpPattern(MLIRContext *context, bool combineNonComplexChains)
+      : OpRewritePattern(context),
+        combineNonComplexChains(combineNonComplexChains) {}
 
   LogicalResult matchAndRewrite(IREE::Codegen::LoadFromBufferOp loadOp,
                                 PatternRewriter &rewriter) const override {
-    // Check if the load has at least one relayout op user.
-    bool hasRelayoutUser =
-        llvm::any_of(loadOp->getUsers(), [](Operation *user) {
-          return isSupportedSingleInputRelayoutOp(user);
-        });
-    if (!hasRelayoutUser) {
+    Value loadResult = loadOp.getResult();
+    SmallPtrSet<Operation *, 4> complexChainUsers =
+        getComplexChainRelayoutUsers(loadResult, combineNonComplexChains);
+    // Only introduce map_load when there is at least one complex chain.
+    if (complexChainUsers.empty()) {
       return failure();
     }
     // Check that the load doesn't already have a map_load user (avoid
@@ -1125,9 +1234,13 @@ struct InsertMapLoadOpPattern
     if (hasMapLoadUser) {
       return failure();
     }
-    (void)insertIdentityMapLoad(rewriter, loadOp->getResult(0));
+    (void)insertIdentityMapLoad(rewriter, cast<OpResult>(loadResult),
+                                complexChainUsers);
     return success();
   }
+
+private:
+  bool combineNonComplexChains;
 };
 
 namespace {
@@ -1149,7 +1262,7 @@ struct CombineSourceLayoutTransformationPass final
     // Insert identity map_load ops after load_from_buffer ops and fold
     // consumer relayout ops into them.
     RewritePatternSet patterns(context);
-    patterns.add<InsertMapLoadOpPattern>(context);
+    patterns.add<InsertMapLoadOpPattern>(context, testCombineNonComplexChains);
     patterns.add<FoldConsumerRelayoutIntoMapLoadPattern>(context);
     memref::populateResolveRankedShapedTypeResultDimsPatterns(patterns);
     if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
