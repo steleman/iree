@@ -72,7 +72,9 @@ nanobind_add_module(iree_runtime_bindings_python_PyExtRt
 
 target_link_libraries(iree_runtime_bindings_python_PyExtRt
   PRIVATE
+  iree::async::util::proactor_pool
   iree::base
+  iree::base::threading
   iree::base::tooling::flags
   iree::hal
   iree::hal::drivers
