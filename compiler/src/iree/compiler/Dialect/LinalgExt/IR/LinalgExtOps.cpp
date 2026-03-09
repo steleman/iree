@@ -3099,36 +3099,13 @@ LogicalResult Im2colOp::verify() {
   // of padding is present (input or output), and specifies the value to use
   // for out-of-bounds positions.
 
-  // Verify batch dim shapes between input and output. M/K dims are not
-  // verified because the output could have padding (e.g. from GEMM
-  // alignment), but batch dims should always match (accounting for any
-  // input padding on the batch dim).
-  ArrayRef<int64_t> inputShape = inputType.getShape();
-  SmallVector<int64_t> inverseOutputPerm =
-      invertPermutationVector(getOutputPerm());
-  ArrayRef<int64_t> staticPadLow = getStaticInputPadLow();
-  ArrayRef<int64_t> staticPadHigh = getStaticInputPadHigh();
-  for (auto [idx, bPos] : llvm::enumerate(batchPos)) {
-    int64_t inputBatchSize = inputShape[bPos];
-    int64_t outputBatchSize = outputShape[inverseOutputPerm[idx]];
-    if (ShapedType::isDynamic(inputBatchSize) ||
-        ShapedType::isDynamic(outputBatchSize))
-      continue;
-    // Account for input padding on this batch dim.
-    int64_t paddedBatchSize = inputBatchSize;
-    if (!staticPadLow.empty() && !staticPadHigh.empty()) {
-      int64_t lo = staticPadLow[bPos];
-      int64_t hi = staticPadHigh[bPos];
-      if (ShapedType::isDynamic(lo) || ShapedType::isDynamic(hi))
-        continue; // Can't verify with dynamic padding.
-      paddedBatchSize += lo + hi;
-    }
-    if (paddedBatchSize != outputBatchSize) {
-      return op->emitOpError("batch dimension size mismatch: input batch dim ")
-             << bPos << " has size " << paddedBatchSize
-             << " (including padding) but output has size " << outputBatchSize;
-    }
-  }
+  // Note: batch dim shapes between input and output are intentionally NOT
+  // verified. With offset-based batch indexing, the output batch dim can be:
+  //   - smaller (tiled: output is a tile, input is the full tensor)
+  //   - equal (untiled case)
+  //   - larger (output padding for alignment, e.g. tile=64, actual=56)
+  // The output_sizes attribute encodes the valid batch region; padding and
+  // bounds checking are handled by computeIm2colPaddingBounds.
 
   return success();
 }

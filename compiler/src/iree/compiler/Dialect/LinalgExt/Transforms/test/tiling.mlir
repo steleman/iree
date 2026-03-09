@@ -1352,8 +1352,6 @@ module attributes { transform.with_named_sequence } {
 // CHECK:            %[[RES2:.+]] = scf.for %[[ARG5:[a-zA-Z0-9_]+]] = %[[C0]] to %[[C5760]] step %[[C4]]
 // CHECK-SAME:         iter_args(%[[ARG6:[a-zA-Z0-9_]+]] = %[[ARG4]]) -> (tensor<2x1024x5760xf32>)
 // CHECK-DAG:          %[[MSIZE:.+]] = affine.min #[[MAP]](%[[ARG3]])
-// CHECK-DAG:          %[[EXTRACTED_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[ARG1]], 0, 0, 0]
-// CHECK-SAME:           [1, 34, 34, 640] [1, 1, 1, 1] : tensor<2x34x34x640xf32> to tensor<1x34x34x640xf32>
 // CHECK-DAG:          %[[EXTRACTED_SLICE_0:.+]] = tensor.extract_slice %[[ARG6]][%[[ARG1]], %[[ARG3]], %[[ARG5]]]
 // CHECK-SAME:           [1, %[[MSIZE]], 4] [1, 1, 1] : tensor<2x1024x5760xf32> to tensor<1x?x4xf32>
 // CHECK-DAG:          %[[MOFFSET:.+]] = affine.apply #[[MAP1]](%[[ARG3]])
@@ -1362,7 +1360,7 @@ module attributes { transform.with_named_sequence } {
 // CHECK-SAME:           offsets = [%[[ARG1]], %[[MOFFSET]], %[[KOFFSET]]] output_sizes = {{\[}}[2], [32, 32], [3, 3, 640]]
 // CHECK-SAME:           batch_pos = [0] m_pos = [1, 2] k_pos = [3]
 // CHECK-SAME:           input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
-// CHECK-SAME:           ins(%[[EXTRACTED_SLICE]] : tensor<1x34x34x640xf32>)
+// CHECK-SAME:           ins(%[[ARG0]] : tensor<2x34x34x640xf32>)
 // CHECK-SAME:           outs(%[[EXTRACTED_SLICE_0]] : tensor<1x?x4xf32>) -> tensor<1x?x4xf32>
 // CHECK:              %[[INSERTED_SLICE:.+]] = tensor.insert_slice %[[IM2COL]] into %[[ARG6]]
 // CHECK-SAME:           [%[[ARG1]], %[[ARG3]], %[[ARG5]]] [1, %[[MSIZE]], 4] [1, 1, 1]
@@ -1412,8 +1410,6 @@ module attributes { transform.with_named_sequence } {
 // CHECK-SAME:         iter_args(%[[ARG6:[a-zA-Z0-9_]+]] = %[[ARG4]]) -> (tensor<2x1024x5760xf32>)
 // CHECK-DAG:          %[[MSIZE:.+]] = affine.min #[[MAP]](%[[ARG3]])
 // CHECK-DAG:          %[[KSIZE:.+]] = affine.min #[[MAP1]](%[[ARG5]])
-// CHECK-DAG:          %[[EXTRACTED_SLICE:.+]] = tensor.extract_slice %[[ARG0]][0, %[[ARG1]], 0, 0]
-// CHECK-SAME:           [640, 1, 101, 172] [1, 1, 1, 1] : tensor<640x2x101x172xf32> to tensor<640x1x101x172xf32>
 // CHECK-DAG:          %[[EXTRACTED_SLICE_0:.+]] = tensor.extract_slice %[[ARG6]][%[[ARG1]], %[[ARG3]], %[[ARG5]]]
 // CHECK-SAME:           [1, %[[MSIZE]], %[[KSIZE]]] [1, 1, 1] : tensor<2x1024x5760xf32> to tensor<1x?x?xf32>
 // CHECK-DAG:          %[[MOFFSET:.+]] = affine.apply #[[MAP2]](%[[ARG3]])
@@ -1422,7 +1418,7 @@ module attributes { transform.with_named_sequence } {
 // CHECK-SAME:           offsets = [%[[ARG1]], %[[MOFFSET]], %[[KOFFSET]]] output_sizes = {{\[}}[2], [32, 32], [5, 2, 640]]
 // CHECK-SAME:           batch_pos = [1] m_pos = [3, 2] k_pos = [0]
 // CHECK-SAME:           input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
-// CHECK-SAME:           ins(%[[EXTRACTED_SLICE]] : tensor<640x1x101x172xf32>)
+// CHECK-SAME:           ins(%[[ARG0]] : tensor<640x2x101x172xf32>)
 // CHECK-SAME:           outs(%[[EXTRACTED_SLICE_0]] : tensor<1x?x?xf32>) -> tensor<1x?x?xf32>
 // CHECK:              %[[INSERTED_SLICE:.+]] = tensor.insert_slice %[[IM2COL]] into %[[ARG6]]
 // CHECK-SAME:           [%[[ARG1]], %[[ARG3]], %[[ARG5]]] [1, %[[MSIZE]], %[[KSIZE]]] [1, 1, 1]
@@ -1458,11 +1454,9 @@ module attributes { transform.with_named_sequence } {
 // CHECK-DAG:  #[[MAP3:.+]] = affine_map<(d0)[s0] -> (d0 + s0)>
 // CHECK:      func.func @im2col_dynamic(%[[ARG0:[a-zA-Z0-9_]+]]: tensor<?x?x?x?xf32>,
 // CHECK-SAME:   %[[S0:.+]]: index, %[[S1:.+]]: index, %[[S2:.+]]: index, %[[MOFF:.+]]: index, %[[KOFF:.+]]: index
-// CHECK-DAG:    %[[C3:.+]] = arith.constant 3 : index
 // CHECK-DAG:    %[[C5:.+]] = arith.constant 5 : index
 // CHECK-DAG:    %[[C7:.+]] = arith.constant 7 : index
 // CHECK-DAG:    %[[C2:.+]] = arith.constant 2 : index
-// CHECK-DAG:    %[[C1:.+]] = arith.constant 1 : index
 // CHECK-DAG:    %[[C0:.+]] = arith.constant 0 : index
 // CHECK:        %[[D0:.+]] = tensor.empty(%[[S0]], %[[S1]], %[[S2]]) : tensor<?x?x?xf32>
 // CHECK:        %[[RES0:.+]] = scf.for %[[ARG1:[a-zA-Z0-9_]+]] = %[[C0]] to %[[S0]] step %[[C2]]
@@ -1474,11 +1468,6 @@ module attributes { transform.with_named_sequence } {
 // CHECK-DAG:          %[[BSIZE:.+]] = affine.min #[[MAP]](%[[ARG1]])
 // CHECK-DAG:          %[[MSIZE:.+]] = affine.min #[[MAP1]](%[[ARG3]])
 // CHECK-DAG:          %[[KSIZE:.+]] = affine.min #[[MAP2]](%[[ARG5]])
-// CHECK-DAG:          %[[DIM1:.+]] = tensor.dim %[[ARG0]], %[[C1]] : tensor<?x?x?x?xf32>
-// CHECK-DAG:          %[[DIM2:.+]] = tensor.dim %[[ARG0]], %[[C2]] : tensor<?x?x?x?xf32>
-// CHECK-DAG:          %[[DIM3:.+]] = tensor.dim %[[ARG0]], %[[C3]] : tensor<?x?x?x?xf32>
-// CHECK-DAG:          %[[EXTRACTED_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[ARG1]], 0, 0, 0]
-// CHECK-SAME:           [%[[BSIZE]], %[[DIM1]], %[[DIM2]], %[[DIM3]]] [1, 1, 1, 1] : tensor<?x?x?x?xf32> to tensor<?x?x?x?xf32>
 // CHECK-DAG:          %[[EXTRACTED_SLICE_0:.+]] = tensor.extract_slice %[[ARG6]][%[[ARG1]], %[[ARG3]], %[[ARG5]]]
 // CHECK-SAME:           [%[[BSIZE]], %[[MSIZE]], %[[KSIZE]]] [1, 1, 1] : tensor<?x?x?xf32> to tensor<?x?x?xf32>
 // CHECK-DAG:          %[[KOFFSET:.+]] = affine.apply #[[MAP3]](%[[ARG5]])[%[[KOFF]]]
@@ -1487,7 +1476,7 @@ module attributes { transform.with_named_sequence } {
 // CHECK-SAME:           offsets = [%[[ARG1]], %[[MOFFSET]], %[[KOFFSET]]] output_sizes = {{\[}}[2], [32, 32], [3, 3, 640]]
 // CHECK-SAME:           batch_pos = [0] m_pos = [1, 2] k_pos = [3]
 // CHECK-SAME:           input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
-// CHECK-SAME:           ins(%[[EXTRACTED_SLICE]] : tensor<?x?x?x?xf32>)
+// CHECK-SAME:           ins(%[[ARG0]] : tensor<?x?x?x?xf32>)
 // CHECK-SAME:           outs(%[[EXTRACTED_SLICE_0]] : tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
 // CHECK:              %[[INSERTED_SLICE:.+]] = tensor.insert_slice %[[IM2COL]] into %[[ARG6]]
 // CHECK-SAME:           [%[[ARG1]], %[[ARG3]], %[[ARG5]]] [%[[BSIZE]], %[[MSIZE]], %[[KSIZE]]] [1, 1, 1]
@@ -1548,15 +1537,13 @@ module attributes { transform.with_named_sequence } {
 // CHECK-DAG:              %[[M0SIZE:.+]] = affine.min #[[MAP]](%[[ARG3]])
 // CHECK-DAG:              %[[M1SIZE:.+]] = affine.min #[[MAP1]](%[[ARG5]])
 // CHECK-DAG:              %[[K0SIZE:.+]] = affine.min #[[MAP2]](%[[ARG7]])
-// CHECK-DAG:              %[[EXTRACTED_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[ARG1]], 0, 0, 0]
-// CHECK-SAME:               [1, 34, 34, 640] [1, 1, 1, 1] : tensor<2x34x34x640xf32> to tensor<1x34x34x640xf32>
 // CHECK-DAG:              %[[EXTRACTED_SLICE_0:.+]] = tensor.extract_slice %[[ARG10]][%[[ARG1]], %[[ARG3]], %[[ARG5]], %[[ARG7]], %[[ARG9]]]
 // CHECK-SAME:               [1, %[[M0SIZE]], %[[M1SIZE]], %[[K0SIZE]], 2] [1, 1, 1, 1, 1] : tensor<2x32x32x1440x4xf32> to tensor<1x?x?x?x2xf32>
 // CHECK:                  %[[IM2COL:.+]] = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
 // CHECK-SAME:               offsets = [%[[ARG1]], %[[ARG3]], %[[ARG5]], %[[ARG7]], %[[ARG9]]] output_sizes = {{\[}}[2], [32], [32], [3, 3], [640]]
 // CHECK-SAME:               batch_pos = [0] m_pos = [1, 2] k_pos = [3]
 // CHECK-SAME:               input_k_perm = [0, 1, 2] output_perm = [0, 1, 2, 3, 4]
-// CHECK-SAME:               ins(%[[EXTRACTED_SLICE]] : tensor<1x34x34x640xf32>)
+// CHECK-SAME:               ins(%[[ARG0]] : tensor<2x34x34x640xf32>)
 // CHECK-SAME:               outs(%[[EXTRACTED_SLICE_0]] : tensor<1x?x?x?x2xf32>) -> tensor<1x?x?x?x2xf32>
 // CHECK:                  %[[INSERTED_SLICE:.+]] = tensor.insert_slice %[[IM2COL]] into %[[ARG10]]
 // CHECK-SAME:               [%[[ARG1]], %[[ARG3]], %[[ARG5]], %[[ARG7]], %[[ARG9]]] [1, %[[M0SIZE]], %[[M1SIZE]], %[[K0SIZE]], 2] [1, 1, 1, 1, 1]

@@ -131,11 +131,16 @@ Im2colSourceIndices computeIm2colSourceIndices(OpBuilder &b, Location loc,
     sliceOffsets[kPos] = kOff;
   }
 
-  // Set batch offsets from loop IVs.
+  // Set batch offsets from offset attribute + loop IVs.
+  // Batch dims are first in canonical [Batch, M, K] order, so
+  // canonicalIdx = ivIdx. The actual output dim comes from the inverse
+  // output permutation.
   SmallVector<int64_t> inverseOutputPerm =
       invertPermutationVector(im2colOp.getOutputPerm());
   for (auto [ivIdx, bPos] : llvm::enumerate(im2colOp.getBatchPos())) {
-    sliceOffsets[bPos] = ivs[inverseOutputPerm[ivIdx]];
+    int64_t canonicalIdx = ivIdx;
+    int64_t actualDim = inverseOutputPerm[canonicalIdx];
+    sliceOffsets[bPos] = addOfrs(b, loc, offsets[canonicalIdx], ivs[actualDim]);
   }
 
   // The innermost input dimension gets innerTileSize as its size.
@@ -271,13 +276,12 @@ computeIm2colPaddingBounds(OpBuilder &b, Location loc, Im2colOp im2colOp,
   Value vecLowPadAmt =
       getValueOrCreateConstantIndexOp(b, loc, vecLowPadAmtOfr);
 
-  // Incorporate out-of-bounds status of non-vectorized spatial and channel
-  // dims. If an adjusted coord is outside [0, dimSize), the valid region is
-  // empty, so clamp validSize and vecLowPadAmt to 0. This handles both
-  // input padding (padLow/padHigh > 0) and output-alignment OOB from
-  // non-wrapping delinearization (coord > dimSize even with zero padding).
-  llvm::SmallDenseSet<int64_t, 4> batchPosSet(im2colOp.getBatchPos().begin(),
-                                               im2colOp.getBatchPos().end());
+  // Incorporate out-of-bounds status of non-vectorized dims (batch, spatial,
+  // and channel). If an adjusted coord is outside [0, dimSize), the valid
+  // region is empty, so clamp validSize and vecLowPadAmt to 0. This handles
+  // input padding (padLow/padHigh > 0), output-alignment OOB from
+  // non-wrapping delinearization (coord > dimSize even with zero padding),
+  // and batch OOB when tile size exceeds the batch dimension.
   // Use affine ops + arith.muli to zero out validSize and vecLowPadAmt when a
   // non-vectorized dim is out of bounds. We compute a 0-or-1 factor using
   // affine.min/max, then multiply: both affine ops and arith.muli are tracked
@@ -317,15 +321,17 @@ computeIm2colPaddingBounds(OpBuilder &b, Location loc, Im2colOp im2colOp,
     validSize = arith::MulIOp::create(b, loc, validSize, factor);
     vecLowPadAmt = arith::MulIOp::create(b, loc, vecLowPadAmt, factor);
   };
+  for (int64_t bPos : im2colOp.getBatchPos())
+    checkDimBounds(bPos);
   for (int64_t mPos : im2colOp.getMPos())
     checkDimBounds(mPos);
   for (int64_t kPos : im2colOp.getKPos())
     checkDimBounds(kPos);
 
   // Clamp read offsets to [0, inputSize-1] to keep extract_slice in-bounds.
-  // Spatial and channel dims need clamping because the adjusted offset can
-  // be negative (padLow > offset) or beyond the input extent (non-wrapping
-  // delinearize OOB). Batch dims are always in-bounds from loop IVs.
+  // All non-vectorized dims need clamping because the adjusted offset can
+  // be negative (padLow > offset), beyond the input extent (non-wrapping
+  // delinearize OOB), or exceed the batch dim when tile > batch size.
   // Use affine.max/affine.min for consistency and to support folding.
   SmallVector<OpFoldResult> readOffsets(inputRank);
   // clampLo = max(adj, 0): use posMaxMap already defined.
@@ -333,10 +339,6 @@ computeIm2colPaddingBounds(OpBuilder &b, Location loc, Im2colOp im2colOp,
   // clamped = min(clampLo, dimMax)
   OpFoldResult oneOfr = b.getIndexAttr(1);
   for (int64_t d = 0; d < inputRank; ++d) {
-    if (batchPosSet.contains(d)) {
-      readOffsets[d] = adjustedOffsets[d];
-      continue;
-    }
     OpFoldResult clampLo =
         affine::makeComposedFoldedAffineMax(b, loc, posMaxMap,
                                             {adjustedOffsets[d]});

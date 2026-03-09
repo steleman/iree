@@ -2413,34 +2413,16 @@ Im2colOp::getTiledImplementation(OpBuilder &builder,
                                  ArrayRef<OpFoldResult> sizes) {
   Location loc = getLoc();
   OpFoldResult one = builder.getIndexAttr(1);
-  OpFoldResult zero = builder.getIndexAttr(0);
 
-  ReifiedRankedShapedTypeDims reifiedInputShapes;
-  SmallVector<OpFoldResult> inputOffsets(getInputRank(), zero);
-  SmallVector<OpFoldResult> inputSizes = getDims(builder, loc, getInput());
-
-  // Set batch offsets and sizes for input
-  for (auto [outDim, inDim] :
-       llvm::zip_equal(getBatchOutputDims(), getBatchPos())) {
-    inputOffsets[inDim] = offsets[outDim];
-    inputSizes[inDim] = sizes[outDim];
-  }
-
-  SmallVector<OpFoldResult> inputStrides(getInputRank(), one);
-
-  // Input
-  Operation *inputSlice = getSlice(builder, loc, getInput(), inputOffsets,
-                                   inputSizes, inputStrides);
+  // The input is passed through without slicing along batch dimensions.
+  // Batch tiling is handled via the offset stored on the im2col op (same
+  // mechanism as M and K dimensions). This avoids out-of-bounds extract_slice
+  // when the tile size exceeds the batch/channel dimension.
+  Value inputValue = getInput();
 
   SmallVector<OpFoldResult> outputStrides(getOutputRank(), one);
   Operation *outputSlice =
       getSlice(builder, loc, getOutput(), offsets, sizes, outputStrides);
-
-  SmallVector<Type, 4> resultTypes;
-  if (hasPureTensorSemantics()) {
-    resultTypes.append(outputSlice->result_type_begin(),
-                       outputSlice->result_type_end());
-  }
 
   // Adjust offsets by adding the tiling offsets. The offsets are in canonical
   // [Batch, M, K] order, and output_perm[actual] = canonical, so we use
@@ -2453,9 +2435,8 @@ Im2colOp::getTiledImplementation(OpBuilder &builder,
         addOfrs(builder, loc, offsets[actual], newOffsets[canonical]);
   }
 
-  // Create the tiled op.
-  SmallVector<Value> operands = {inputSlice->getResult(0),
-                                 outputSlice->getResult(0)};
+  // Create the tiled op. The input is not sliced (batch offset is in the op).
+  SmallVector<Value> operands = {inputValue, outputSlice->getResult(0)};
   // Copy all metadata operands from the untiled operation.
   operands.append(getOperation()->getOperands().begin() + 2,
                   getOperation()->getOperands().end());
@@ -2467,7 +2448,7 @@ Im2colOp::getTiledImplementation(OpBuilder &builder,
 
   return TilingResult{{tiledOp},
                       SmallVector<Value>(tiledOp->getResults()),
-                      {inputSlice, outputSlice}};
+                      {outputSlice}};
 }
 
 FailureOr<TilingResult>

@@ -19,6 +19,8 @@ module {
 }
 //   CHECK-DAG: #[[$MAP:.+]] = affine_map<()[s0] -> (s0 * 4)>
 //   CHECK-DAG: #[[$MAP1:.+]] = affine_map<(d0)[s0] -> (d0 + s0)>
+//   CHECK-DAG: #[[$BMAX:.+]] = affine_map<(d0) -> (0, d0)>
+//   CHECK-DAG: #[[$BMIN:.+]] = affine_map<(d0) -> (1, d0)>
 //   CHECK-DAG: #[[$MAP2:.+]] = affine_map<(d0)[s0] -> (0, d0 + s0)>
 //   CHECK-DAG: #[[$MAP3:.+]] = affine_map<(d0) -> (33, d0)>
 //   CHECK-DAG: #[[$MAP4:.+]] = affine_map<()[s0] -> (0, s0)>
@@ -38,13 +40,15 @@ module {
 //   CHECK-DAG:       %[[kParts:.+]]:3 = affine.delinearize_index %[[kScaled]] into (3, 640) : index, index, index
 //   CHECK-DAG:       %[[mIDX:.+]] = affine.apply #[[$MAP1]](%[[m]])[%[[mOFF]]]
 //   CHECK-DAG:       %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (32) : index, index
+//   CHECK-DAG:       %[[bCLAMP0:.+]] = affine.max #[[$BMAX]](%[[b]])
+//   CHECK-DAG:       %[[bCLAMP:.+]] = affine.min #[[$BMIN]](%[[bCLAMP0]])
 //   CHECK-DAG:       %[[hCLAMP0:.+]] = affine.max #[[$MAP2]](%[[mParts]]#0)[%[[kParts]]#0]
 //   CHECK-DAG:       %[[hCLAMP:.+]] = affine.min #[[$MAP3]](%[[hCLAMP0]])
 //   CHECK-DAG:       %[[wCLAMP0:.+]] = affine.max #[[$MAP2]](%[[mParts]]#1)[%[[kParts]]#1]
 //   CHECK-DAG:       %[[wCLAMP:.+]] = affine.min #[[$MAP3]](%[[wCLAMP0]])
 //   CHECK-DAG:       %[[kCLAMP0:.+]] = affine.max #[[$MAP4]]()[%[[kParts]]#2]
 //   CHECK-DAG:       %[[kCLAMP:.+]] = affine.min #[[$MAP5]]()[%[[kCLAMP0]]]
-//       CHECK:       %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[b]], %[[hCLAMP]], %[[wCLAMP]], %[[kCLAMP]]] [1, 1, 1, 4]
+//       CHECK:       %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[bCLAMP]], %[[hCLAMP]], %[[wCLAMP]], %[[kCLAMP]]] [1, 1, 1, 4]
 //       CHECK:       linalg.copy ins(%[[IN_SLICE]]
 //       CHECK:       tensor.insert_slice {{.*}} into %[[OUT1]][%[[b]], %[[m]], 0] [1, 1, 4] [1, 1, 1] : tensor<4xf32> into tensor<2x?x4xf32>
 //       CHECK:       scf.yield {{.*}} : tensor<2x?x4xf32>
@@ -73,6 +77,7 @@ module {
 //   CHECK-DAG: #[[$MAP:.+]] = affine_map<(d0)[s0] -> (d0 + s0)>
 //   CHECK-DAG: #[[$MAP1:.+]] = affine_map<(d0) -> (0, d0)>
 //   CHECK-DAG: #[[$MAP2:.+]] = affine_map<(d0) -> (639, d0)>
+//   CHECK-DAG: #[[$BMIN:.+]] = affine_map<(d0) -> (1, d0)>
 //   CHECK-DAG: #[[$MAP3:.+]] = affine_map<(d0, d1) -> (0, d0 * 3 + d1 * 7)>
 //   CHECK-DAG: #[[$MAP4:.+]] = affine_map<(d0) -> (100, d0)>
 //   CHECK-DAG: #[[$MAP5:.+]] = affine_map<(d0, d1) -> (0, d0 * 5 + d1 * 4)>
@@ -96,11 +101,13 @@ module {
 //   CHECK-DAG:         %[[mParts:.+]]:2 = affine.delinearize_index %[[mIDX]] into (32) : index, index
 //   CHECK-DAG:         %[[kCLAMP0:.+]] = affine.max #[[$MAP1]](%[[kParts]]#0)
 //   CHECK-DAG:         %[[kCLAMP:.+]] = affine.min #[[$MAP2]](%[[kCLAMP0]])
+//   CHECK-DAG:         %[[bCLAMP0:.+]] = affine.max #[[$MAP1]](%[[b]])
+//   CHECK-DAG:         %[[bCLAMP:.+]] = affine.min #[[$BMIN]](%[[bCLAMP0]])
 //   CHECK-DAG:         %[[wCLAMP0:.+]] = affine.max #[[$MAP3]](%[[mParts]]#1, %[[kParts]]#2)
 //   CHECK-DAG:         %[[wCLAMP:.+]] = affine.min #[[$MAP4]](%[[wCLAMP0]])
 //   CHECK-DAG:         %[[hCLAMP0:.+]] = affine.max #[[$MAP5]](%[[mParts]]#0, %[[kParts]]#1)
 //   CHECK-DAG:         %[[hCLAMP:.+]] = affine.min #[[$MAP6]](%[[hCLAMP0]])
-//       CHECK:         %[[IN_SLICE2:.+]] = tensor.extract_slice %[[ARG0]][%[[kCLAMP]], %[[b]], %[[wCLAMP]], %[[hCLAMP]]] [1, 1, 1, 1]
+//       CHECK:         %[[IN_SLICE2:.+]] = tensor.extract_slice %[[ARG0]][%[[kCLAMP]], %[[bCLAMP]], %[[wCLAMP]], %[[hCLAMP]]] [1, 1, 1, 1]
 //       CHECK:         linalg.copy ins(%[[IN_SLICE2]]
 //       CHECK:         tensor.insert_slice {{.*}} into %[[OUT2]][%[[b]], %[[m]], %[[k]]] [1, 1, 1] [1, 1, 1] : tensor<1xf32> into tensor<2x?x?xf32>
 //       CHECK:         scf.yield {{.*}} : tensor<2x?x?xf32>
@@ -125,6 +132,8 @@ module {
   }
 }
 //   CHECK-DAG: #[[$MAP:.+]] = affine_map<(d0)[s0] -> (d0 + s0)>
+//   CHECK-DAG: #[[$BMAX:.+]] = affine_map<(d0) -> (0, d0)>
+//   CHECK-DAG: #[[$BMIN:.+]] = affine_map<(d0) -> (1, d0)>
 //   CHECK-DAG: #[[$MAP1:.+]] = affine_map<(d0, d1)[s0] -> (0, d0 + d1 + s0)>
 //   CHECK-DAG: #[[$MAP2:.+]] = affine_map<(d0) -> (33, d0)>
 // CHECK-LABEL: func.func @im2col_expanded
@@ -145,12 +154,14 @@ module {
 //       CHECK:         %[[kLOOP:.+]] = scf.for %[[k:.+]] = %[[C0]] to %[[C2]] step %[[C1]] iter_args(%[[OUT3:.+]] = %[[OUT2]]) -> (tensor<2x?x?x2x4xf32>)
 //   CHECK-DAG:           %[[kIDX:.+]] = affine.apply #[[$MAP]](%[[k]])[%[[kOFF]]]
 //   CHECK-DAG:           %[[kParts:.+]]:2 = affine.delinearize_index %[[kIDX]] into (3) : index, index
+//   CHECK-DAG:           %[[bCLAMP0:.+]] = affine.max #[[$BMAX]](%[[b]])
+//   CHECK-DAG:           %[[bCLAMP:.+]] = affine.min #[[$BMIN]](%[[bCLAMP0]])
 //   CHECK-DAG:           %[[hCLAMP0:.+]] = affine.max #[[$MAP1]](%[[kParts]]#0, %[[m0]])[%[[mOFF0]]]
 //   CHECK-DAG:           %[[hCLAMP:.+]] = affine.min #[[$MAP2]](%[[hCLAMP0]])
 //   CHECK-DAG:           %[[wCLAMP0:.+]] = affine.max #[[$MAP1]](%[[kParts]]#1, %[[m1]])[%[[mOFF1]]]
 //   CHECK-DAG:           %[[wCLAMP:.+]] = affine.min #[[$MAP2]](%[[wCLAMP0]])
 //       CHECK:           %[[DEST_SLICE:.+]] = tensor.extract_slice %[[OUT3]][%[[b]], %[[m0]], %[[m1]], %[[k]], 0] [1, 1, 1, 1, 4] {{.*}} : tensor<2x?x?x2x4xf32> to tensor<4xf32>
-//       CHECK:           %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[b]], %[[hCLAMP]], %[[wCLAMP]], 0] [1, 1, 1, 4] [1, 1, 1, 1] : tensor<2x34x34x640xf32> to tensor<4xf32>
+//       CHECK:           %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[bCLAMP]], %[[hCLAMP]], %[[wCLAMP]], 0] [1, 1, 1, 4] [1, 1, 1, 1] : tensor<2x34x34x640xf32> to tensor<4xf32>
 //       CHECK:           %[[COPY:.+]] = linalg.copy ins(%[[IN_SLICE]] : tensor<4xf32>) outs(%[[DEST_SLICE]] : tensor<4xf32>)
 //       CHECK:           %[[INSERT:.+]] = tensor.insert_slice %[[COPY]] into %[[OUT3]][%[[b]], %[[m0]], %[[m1]], %[[k]], 0] [1, 1, 1, 1, 4] [1, 1, 1, 1, 1] : tensor<4xf32> into tensor<2x?x?x2x4xf32>
 //       CHECK:           scf.yield %[[INSERT]] : tensor<2x?x?x2x4xf32>
@@ -482,6 +493,7 @@ module {
 //   CHECK-DAG: #[[$MAP3:.+]] = affine_map<(d0, d1)[s0] -> (0, d0 + d1 + s0)>
 //   CHECK-DAG: #[[$MAP4:.+]] = affine_map<(d0) -> (25, d0)>
 //   CHECK-DAG: #[[$MAP5:.+]] = affine_map<(d0) -> (17, d0)>
+//   CHECK-DAG: #[[$BMIN:.+]] = affine_map<(d0) -> (1, d0)>
 // CHECK-LABEL: func.func @im2col_chwn_output_perm_expanded
 //  CHECK-SAME: %[[ARG0:[a-zA-Z0-9_]+]]: tensor<16x26x18x2x4xf32>
 //  CHECK-SAME: %[[ARG1:[a-zA-Z0-9_]+]]: index
@@ -504,8 +516,10 @@ module {
 //   CHECK-DAG:           %[[hCLAMP:.+]] = affine.min #[[$MAP4]](%[[hCLAMP0]])
 //   CHECK-DAG:           %[[wCLAMP0:.+]] = affine.max #[[$MAP3]](%[[IV1]], %[[IV3]])[%[[ARG2]]]
 //   CHECK-DAG:           %[[wCLAMP:.+]] = affine.min #[[$MAP5]](%[[wCLAMP0]])
+//   CHECK-DAG:           %[[bCLAMP0:.+]] = affine.max #[[$MAP1]](%[[IV4]])
+//   CHECK-DAG:           %[[bCLAMP:.+]] = affine.min #[[$BMIN]](%[[bCLAMP0]])
 //       CHECK:           %[[DEST_SLICE:.+]] = tensor.extract_slice %[[ARG8]][%[[IV0]], %[[IV1]], %[[IV2]], %[[IV3]], %[[IV4]], 0] [1, 1, 1, 1, 1, 4] {{.*}} : tensor<2x2x2x2x2x4xf32> to tensor<4xf32>
-//       CHECK:           %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[kCLAMP]], %[[hCLAMP]], %[[wCLAMP]], %[[IV4]], 0] [1, 1, 1, 1, 4] [1, 1, 1, 1, 1] : tensor<16x26x18x2x4xf32> to tensor<4xf32>
+//       CHECK:           %[[IN_SLICE:.+]] = tensor.extract_slice %[[ARG0]][%[[kCLAMP]], %[[hCLAMP]], %[[wCLAMP]], %[[bCLAMP]], 0] [1, 1, 1, 1, 4] [1, 1, 1, 1, 1] : tensor<16x26x18x2x4xf32> to tensor<4xf32>
 //       CHECK:           %[[COPY:.+]] = linalg.copy ins(%[[IN_SLICE]] : tensor<4xf32>) outs(%[[DEST_SLICE]] : tensor<4xf32>)
 //       CHECK:           %[[INSERT:.+]] = tensor.insert_slice %[[COPY]] into %[[ARG8]][%[[IV0]], %[[IV1]], %[[IV2]], %[[IV3]], %[[IV4]], 0] [1, 1, 1, 1, 1, 4] [1, 1, 1, 1, 1, 1] : tensor<4xf32> into tensor<2x2x2x2x2x4xf32>
 //       CHECK:           scf.yield %[[INSERT]] : tensor<2x2x2x2x2x4xf32>
@@ -1066,12 +1080,14 @@ module {
 // -----
 
 // Batch > 1 with input padding: verifies that the batch dimension is correctly
-// passed through in the padded decomposition path.
+// handled in the padded decomposition path. With offset-based batch indexing,
+// the batch IV is clamped (affine.max/min) before use in extract_slice.
 // CHECK-LABEL: func.func @im2col_batched_with_padding
 //  CHECK-SAME:     %[[INPUT:[a-zA-Z0-9_]+]]
 //       CHECK:   scf.for %[[BATCH:.*]] = %{{.*}} to %{{.*}}
 //       CHECK:     scf.for
-//       CHECK:       tensor.extract_slice %[[INPUT]][%[[BATCH]]
+//       CHECK:       affine.max {{.*}}(%[[BATCH]])
+//       CHECK:       tensor.extract_slice %[[INPUT]]
 //       CHECK:       tensor.pad
 //       CHECK:       tensor.insert_slice
 // CHECK-UNROLL-LABEL: func.func @im2col_batched_with_padding
